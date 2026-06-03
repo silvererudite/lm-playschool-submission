@@ -1,0 +1,45 @@
+# Upstream repos (cloned by setup.sh, not tracked here)
+playpen/
+clembench/
+
+# Secrets — never commit. key.json holds HF/OpenAI/etc API keys.
+key.json
+*.key
+*.pem
+.env
+.env.*
+
+# Local-only Claude Code working directory (history, sessions, plans, tasks)
+.claude/
+
+# Caches and runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model checkpoints + eval outputs (also live on NVMe via symlinks)
+models/
+playpen-eval/
+results/
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+
+# Data caches
+hf-cache/
+datasets-cache/
+
+# Logs (kept on disk, not in git)
+logs/
+*.log
+
+# Editor / OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp

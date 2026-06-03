@@ -9,69 +9,138 @@ exposing the hyperparameters we expect to tune across iterations:
   * epochs, batch size, learning rate
   * eval split fraction
 
-Run via:
+Run single-GPU:
     source env.sh
     playpen run scripts/train_sft.py -l Qwen3.5-2B
 
+Run multi-GPU (data parallel via accelerate; ~4x speedup on 4 A10Gs):
+    source env.sh
+    accelerate launch --num_processes 4 --num_machines 1 \\
+        --mixed_precision bf16 \\
+        $(which playpen) run scripts/train_sft.py -l Qwen3.5-2B
+
 Tweak the CONFIG block below; restart playpen run. Loaded by playpen's CLI
 which discovers the BasePlaypenTrainer subclass automatically.
+
+Note on multi-GPU: clemcore's huggingface_local backend hardcodes
+device_map="auto", which pipeline-parallel-shards the model across all
+visible GPUs and runs only one GPU at a time. For DDP we want each rank to
+hold a full model copy on its own GPU. We monkeypatch `load_model` at
+module import time (which runs *before* clemcore loads the model in
+playpen's CLI) so that under accelerate, each rank uses
+device_map={"": LOCAL_RANK}.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import trl
 from datasets import load_dataset
 from peft import LoraConfig
 
+from clemcore.backends import huggingface_local_api as _hf_api
 from clemcore.backends.huggingface_local_api import HuggingfaceLocalModel
 from playpen import BasePlaypenTrainer
 
 
-# ----------------------------- configuration ----------------------------- #
+# ----------------------------- DDP patch ----------------------------- #
+# Pin the model to the current rank's GPU when launched under accelerate /
+# torchrun. The presence of LOCAL_RANK is the standard DDP signal.
 
-@dataclass
-class TrainConfig:
+def _patch_clemcore_for_ddp() -> None:
+    local_rank_str = os.environ.get("LOCAL_RANK")
+    if local_rank_str is None:
+        return  # single-process: keep upstream device_map="auto"
+
+    local_rank = int(local_rank_str)
+    _orig_load_model = _hf_api.load_model
+
+    def _load_model_ddp(model_spec):
+        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+        from clemcore.backends.utils.key_registry import KeyRegistry
+        from peft import PeftModel
+
+        model_args = dict(device_map={"": local_rank}, torch_dtype="auto")
+        bnb_kwargs = {}
+        if "load_in_8bit" in model_spec.model_config:
+            bnb_kwargs["load_in_8bit"] = model_spec.model_config["load_in_8bit"]
+        if "load_in_4bit" in model_spec.model_config:
+            bnb_kwargs["load_in_4bit"] = model_spec.model_config["load_in_4bit"]
+        if bnb_kwargs:
+            model_args["quantization_config"] = BitsAndBytesConfig(**bnb_kwargs)
+        if model_spec.model_config.get("requires_api_key"):
+            key = KeyRegistry.from_json().get_key_for("huggingface")
+            model_args["token"] = key["api_key"]
+        if model_spec.model_config.get("trust_remote_code"):
+            model_args["trust_remote_code"] = True
+        if "attn_implementation" in model_spec.model_config:
+            model_args["attn_implementation"] = (
+                model_spec.model_config["attn_implementation"]
+            )
+
+        print(f"[train_sft] DDP: loading {model_spec['huggingface_id']} "
+              f"with device_map={{'': {local_rank}}}")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_spec["huggingface_id"], **model_args
+        )
+        if "peft_model" in model_spec.model_config:
+            model = PeftModel.from_pretrained(
+                model, model_spec.model_config["peft_model"]
+            )
+        return model
+
+    _hf_api.load_model = _load_model_ddp
+
+
+_patch_clemcore_for_ddp()
+
+
+# ----------------------------- configuration ----------------------------- #
+# SimpleNamespace instead of @dataclass — the upstream CLI loads this file
+# without registering the module in sys.modules, which breaks dataclasses.
+
+CONFIG = SimpleNamespace(
     # data
-    dataset_name: str = "colab-potsdam/playpen-data"
-    dataset_subset: str = "interactions"
-    success_only: bool = True
-    eval_split: float = 0.2
-    seed: int = 42
+    dataset_name="colab-potsdam/playpen-data",
+    dataset_subset="interactions",
+    success_only=True,
+    eval_split=0.2,
+    seed=42,
 
     # tokenization / packing
-    max_length: int = 300        # upstream default; bump to 1024+ in iter 2
-    packing: bool = False
-    completion_only_loss: bool = True
+    max_length=300,        # upstream default; bump to 1024+ in iter 2
+    packing=False,
+    completion_only_loss=True,
 
-    # optimization
-    num_train_epochs: int = 3
-    per_device_train_batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    learning_rate: float = 2e-4
-    warmup_ratio: float = 0.03
-    weight_decay: float = 0.0
-    lr_scheduler_type: str = "cosine"
+    # optimization. Effective global batch = num_gpus * per_device * grad_accum.
+    # Iter 1 single-GPU defaults gave 1*1*8=8. With 4 GPUs we keep ≈8 via
+    # 4 * 2 * 1, doubling throughput per GPU to fully use VRAM.
+    num_train_epochs=3,
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=1,
+    learning_rate=2e-4,
+    warmup_ratio=0.03,
+    weight_decay=0.0,
+    lr_scheduler_type="cosine",
+    bf16=True,
+    gradient_checkpointing=False,
 
     # eval & logging
-    eval_strategy: str = "epoch"
-    logging_steps: int = 25
-    save_strategy: str = "epoch"
-    save_total_limit: int = 2
+    eval_strategy="epoch",
+    logging_steps=25,
+    save_strategy="epoch",
+    save_total_limit=2,
 
     # lora
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    lora_target_modules: str | list[str] = "all-linear"
-    lora_modules_to_save: list[str] = field(
-        default_factory=lambda: ["lm_head", "embed_token"]
-    )
-
-
-CONFIG = TrainConfig()
+    lora_r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    lora_target_modules="all-linear",
+    lora_modules_to_save=["lm_head", "embed_token"],
+)
 
 
 # ----------------------------- trainer ----------------------------- #
@@ -112,10 +181,13 @@ class PlayschoolSftTrainer(BasePlaypenTrainer):
             warmup_ratio=CONFIG.warmup_ratio,
             weight_decay=CONFIG.weight_decay,
             lr_scheduler_type=CONFIG.lr_scheduler_type,
+            bf16=CONFIG.bf16,
+            gradient_checkpointing=CONFIG.gradient_checkpointing,
             eval_strategy=CONFIG.eval_strategy,
             logging_steps=CONFIG.logging_steps,
             save_strategy=CONFIG.save_strategy,
             save_total_limit=CONFIG.save_total_limit,
+            ddp_find_unused_parameters=False,
             report_to=[],
         )
 

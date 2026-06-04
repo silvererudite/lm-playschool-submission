@@ -116,9 +116,15 @@ CONFIG = SimpleNamespace(
     gradient_checkpointing=True,
 
     # eval & logging
+    # save_strategy="epoch" with 3 epochs over 6063 steps means the first
+    # checkpoint doesn't land until step 2021 — ~1.5h on 4xA10G with no
+    # crash recovery before that. Save every 1000 steps with total_limit=2
+    # so we always have a recent fallback. (Iter 2 ran with the previous
+    # "epoch" setting; this changes future runs only.)
     eval_strategy="epoch",
     logging_steps=25,
-    save_strategy="epoch",
+    save_strategy="steps",
+    save_steps=1000,
     save_total_limit=2,
 
     # lora
@@ -177,6 +183,7 @@ class PlayschoolSftTrainer(BasePlaypenTrainer):
             eval_strategy=CONFIG.eval_strategy,
             logging_steps=CONFIG.logging_steps,
             save_strategy=CONFIG.save_strategy,
+            save_steps=CONFIG.save_steps,
             save_total_limit=CONFIG.save_total_limit,
             ddp_find_unused_parameters=False,
             report_to=[],

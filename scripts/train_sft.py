@@ -111,7 +111,9 @@ CONFIG = SimpleNamespace(
     seed=42,
 
     # tokenization / packing
-    max_length=300,        # upstream default; bump to 1024+ in iter 2
+    # iter 1 used 300 (upstream default) — verified to truncate 64% of
+    # episodes; see RUNS/iter1.md. 1024 covers ~82%, 2048 ~95%.
+    max_length=1024,
     packing=False,
     completion_only_loss=True,
 
@@ -135,11 +137,15 @@ CONFIG = SimpleNamespace(
     save_total_limit=2,
 
     # lora
+    # iter 1 used modules_to_save=["lm_head", "embed_token"] — Qwen's module
+    # is "embed_tokens" (plural) so peft only matched lm_head, then set
+    # tie_word_embeddings=False, breaking the tied-weight invariant. See
+    # RUNS/iter1.md root cause #1. Empty list = pure LoRA, no full-rank heads.
     lora_r=16,
     lora_alpha=32,
     lora_dropout=0.05,
     lora_target_modules="all-linear",
-    lora_modules_to_save=["lm_head", "embed_token"],
+    lora_modules_to_save=[],
 )
 
 

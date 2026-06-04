@@ -3,22 +3,58 @@
 **Status:** Trained, evaluated, **NOT submitted.** SFT made the model worse than baseline.
 Documented here so iter 2 can pick up cleanly.
 
-## TL;DR — what to fix in iter 2
+## TL;DR — root causes (verified, not guesses)
 
-1. **`max_length=300` truncated most game contexts.** Most clembench transcripts are
-   far longer; the model trained almost entirely on dialogue prefixes that never
-   reached the assistant turn we wanted to predict. Bump to 1024 or 2048 (verify
-   against per-episode length stats first).
-2. **`modules_to_save=["lm_head", "embed_token"]` (the LoRA upstream default)
-   touched the output head and embeddings.** This likely disrupted the chat
-   template formatting Qwen relies on. Drop it.
-3. **Success-only filter is a strong distribution shift.** The training set is
-   "things 9B/27B teachers got right." Imitating that style at 2B parameters
-   may have collapsed format adherence. Revisit: keep all outcomes, or weight
-   by outcome.
+1. **Upstream typo + tied-weight breakage (the destructive bug).**
+   `playpen/examples/trl/sft_trainer_lora.py` line 51 sets
+   `modules_to_save=["lm_head", "embed_token"]`. Qwen's module is named
+   `embed_tokens` (plural) — peft silently ignored the typo'd name and *only*
+   made `lm_head` trainable. But Qwen3.5-2B has `tie_word_embeddings: True`
+   (input embedding == output head, same tensor). Adding `lm_head` to
+   `modules_to_save` made peft set `tie_word_embeddings=False` and create a
+   separate trainable copy of `lm_head`. After 6063 steps, the output head
+   drifted from the still-original-tied embedding; at inference, the model is
+   using a *different* lm_head than the embedding it was pretrained against.
+   This breaks an architectural invariant Qwen depends on, which explains why
+   the model loses chat-format adherence.
 
-After fixing those, re-run before considering anything else (lr tuning, RL,
-distillation).
+   *Confirmed by inspecting the merged model on HF: `tie_word_embeddings: False`
+   in our config, `True` in the base. peft's merge step also emitted the
+   warning "Setting `tie_word_embeddings=False` in the model config" — visible
+   in `logs/post-train.log`.*
+
+2. **`max_length=300` truncated 64% of training episodes.**
+   Measured episode lengths (after applying Qwen's chat template, n=500
+   sample of the success-filtered split):
+
+   ```
+   median: 462    p75: 814    p90: 1373    p95: 2020    max: 8962
+   over 300 tokens: 318/500 = 63.6%
+   over 1024 tokens: 88/500 = 17.6%
+   ```
+
+   With `completion_only_loss=True`, two-thirds of samples were truncated
+   *before reaching the assistant turn we wanted to predict*. Most training
+   steps got near-zero useful gradient. This made training inefficient but
+   isn't destructive on its own — problem (1) is.
+
+3. **Success-only filter is a 1.7× shrink (34,909 → 20,202 episodes), unverified.**
+   Possibly fine on its own. Not the immediate culprit. Revisit only after
+   fixing (1) and (2).
+
+## Iter 2 fixes (in priority order)
+
+1. **Stop training the tied weight.** Drop `modules_to_save` entirely:
+   ```python
+   peft_config=LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+                          target_modules="all-linear", task_type="CAUSAL_LM")
+   ```
+   Or, if we want to train embeddings, use the *correct* name `embed_tokens`
+   AND keep `tie_word_embeddings=True` after merging.
+2. **Bump `max_length` to 1024.** Covers ~82% of episodes uncut. Going higher
+   (2048 = ~95% covered) costs ~4× more memory at attention; may force
+   batch_size=1 with grad accum.
+3. (Defer) success-filter and lr tuning until 1 + 2 are validated.
 
 ## What we ran
 
@@ -97,44 +133,52 @@ ifeval and eqbench drops are huge — these are instruction-following and
 emotional-intelligence benchmarks. Strong evidence that SFT damaged the model's
 chat-format adherence (which `modules_to_save=["lm_head", "embed_token"]` would do).
 
-## Hypotheses (why it failed)
+## Root cause (verified post-debug)
 
-In rough confidence order:
+See "TL;DR — root causes" at the top of this file. Two confirmed problems:
 
-1. **`modules_to_save` lobotomized the output distribution.** LoRA usually leaves
-   `lm_head` frozen; the upstream script overrides this and trains the full
-   embedding + head, which means at LoRA r=16 we only have a low-rank middle but
-   full-rank output. The output likely overfit to the success-filtered token
-   distribution.
-2. **Truncation at 300 tokens.** Quick check: `colab-potsdam/playpen-data`
-   episodes for clembench games typically run 500–4000+ tokens. With max_length=300
-   most training samples were being cut before the assistant turn even started —
-   meaning the loss was computed on padding or on irrelevant prefixes. We didn't
-   instrument what fraction of samples were affected.
-3. **Success-only is a hard mode shift.** The success episodes come predominantly
-   from larger teachers. A 2B model imitating a 9B's tactical move-by-move output
-   with completion-only loss will overfit to surface tokens and break game
-   protocol on its own.
-4. **Default lr (5e-5) too high for the LoRA + full embedding combo.**
-   Each gradient update touched ~half a billion params via the embedding/head;
-   that's not LoRA territory.
+1. **The destructive bug** is the upstream `embed_token` typo in
+   `playpen/examples/trl/sft_trainer_lora.py` line 51 combined with Qwen's
+   tied embeddings. peft set `tie_word_embeddings: False` and trained a
+   separate `lm_head`, leaving the embedding side pinned to base. After 6063
+   steps the head drifted away from the embedding it's meant to be tied to.
+   This explains the format collapse on imagegame, wordle_*, ifeval, and
+   eqbench (all of which require strict output-token discipline).
+2. **The inefficiency multiplier** is `max_length=300`. Empirically, 64% of
+   success-filtered episodes are longer than 300 tokens — for those, with
+   `completion_only_loss=True`, the loss target was truncated and we got no
+   useful gradient. Two-thirds of compute wasted.
 
-## Artifacts (preserved)
+The combination — destructive (1) + 64% wasted compute (2) — is what got us
+from "small SFT improvement" to "−8.7 clemscore."
 
-- **Adapter weights:** `/mnt/sagemaker-nvme/lm-playschool/models/sft+lora/Qwen3.5-2B/checkpoint-{500,1000,...,6000,6063}/` (gitignored — restore from NVMe)
-- **Merged model:** `/mnt/sagemaker-nvme/lm-playschool/dist/lm-playschool-qwen3.5-2b-sft/` (4.8 GB, gitignored)
+## Artifacts
+
+⚠ **`/mnt/sagemaker-nvme/` is ephemeral on this SageMaker instance.** It got
+wiped between sessions (instance restart). All checkpoints, eval transcripts,
+training logs that lived on NVMe are gone. Anything not in git or on
+HuggingFace was lost.
+
+Surviving:
 - **HuggingFace mirror:** https://huggingface.co/Shamima/lm-playschool-qwen3.5-2b-sft
-- **Eval dirs (full transcripts + per-game scores):**
-  - Baseline: `/mnt/sagemaker-nvme/lm-playschool/playpen-eval/2026-06-03T23-13-51/`
-  - SFT: `/mnt/sagemaker-nvme/lm-playschool/playpen-eval/2026-06-04T00-58-01/`
-- **Training log:** `logs/sft-lora.log` (gitignored)
-- **Comparison table:** `results/iter1.md` (tracked)
+  (4.8 GB merged model + tokenizer + provenance JSON)
+- **In git:** `RUNS/iter1.md`, `results/iter1.md`, `results/iter1/*.csv`,
+  `results/iter1/*.val.json`
+- **In `/home/sagemaker-user/`:** `logs/sft-lora.log` (training output),
+  the project repo, the venv, `key.json`
+
+For iter 2: if we want diagnostic transcripts to compare against, write a
+small recurring sync to push them to S3 or to git-lfs. The eval dir is
+~hundreds of MB so git-lfs is reasonable for a sample.
 
 ## Open issues for iter 2
 
-1. **Bump `max_length` to 1024+.** Run a length histogram first; pick a value
-   that covers ~80% of episodes. Confirm in `scripts/train_sft.py` CONFIG.
-2. **Drop `modules_to_save`** (use bare LoRA on `target_modules="all-linear"`).
+1. **Drop `modules_to_save` entirely** (or fix the `embed_token` →
+   `embed_tokens` typo *and* keep `tie_word_embeddings=True` after merge).
+   This is the single change most likely to flip the regression to a gain.
+2. **Bump `max_length` to 1024.** Already verified: this covers ~82% of
+   episodes (vs 36% at 300). Going to 2048 covers ~95% but ~4× attention
+   memory; check it fits before committing.
 3. **Try DDP again.** The fixes are already in `scripts/train_sft.py`:
    the `_patch_clemcore_for_ddp()` monkeypatch flips `device_map="auto"` to
    `device_map={"": LOCAL_RANK}` when `LOCAL_RANK` is set. Launch with

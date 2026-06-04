@@ -41,61 +41,41 @@ import trl
 from datasets import load_dataset
 from peft import LoraConfig
 
-from clemcore.backends import huggingface_local_api as _hf_api
 from clemcore.backends.huggingface_local_api import HuggingfaceLocalModel
 from playpen import BasePlaypenTrainer
 
 
 # ----------------------------- DDP patch ----------------------------- #
-# Pin the model to the current rank's GPU when launched under accelerate /
-# torchrun. The presence of LOCAL_RANK is the standard DDP signal.
+# clemcore's huggingface backend hardcodes device_map="auto" in
+# AutoModelForCausalLM.from_pretrained. Under accelerate/torchrun, "auto"
+# pipeline-shards across all visible GPUs — wrong for DDP, where each rank
+# wants the full model on its own GPU.
+#
+# Instead of mirroring clemcore's load_model (which drifts as upstream
+# evolves), we intercept AutoModelForCausalLM.from_pretrained and override
+# device_map when LOCAL_RANK is set. Smaller blast radius, no copy-paste.
 
-def _patch_clemcore_for_ddp() -> None:
+def _patch_device_map_for_ddp() -> None:
     local_rank_str = os.environ.get("LOCAL_RANK")
     if local_rank_str is None:
         return  # single-process: keep upstream device_map="auto"
 
     local_rank = int(local_rank_str)
-    _orig_load_model = _hf_api.load_model
+    from transformers import AutoModelForCausalLM
+    _orig_from_pretrained = AutoModelForCausalLM.from_pretrained
 
-    def _load_model_ddp(model_spec):
-        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-        from clemcore.backends.utils.key_registry import KeyRegistry
-        from peft import PeftModel
+    @classmethod
+    def _from_pretrained_ddp(cls, *args, **kwargs):
+        kwargs["device_map"] = {"": local_rank}
+        if local_rank == 0:
+            print(f"[train_sft] DDP: from_pretrained device_map -> "
+                  f"{{'': {local_rank}}}", flush=True)
+        return _orig_from_pretrained.__func__(cls, *args, **kwargs)
 
-        model_args = dict(device_map={"": local_rank}, torch_dtype="auto")
-        bnb_kwargs = {}
-        if "load_in_8bit" in model_spec.model_config:
-            bnb_kwargs["load_in_8bit"] = model_spec.model_config["load_in_8bit"]
-        if "load_in_4bit" in model_spec.model_config:
-            bnb_kwargs["load_in_4bit"] = model_spec.model_config["load_in_4bit"]
-        if bnb_kwargs:
-            model_args["quantization_config"] = BitsAndBytesConfig(**bnb_kwargs)
-        if model_spec.model_config.get("requires_api_key"):
-            key = KeyRegistry.from_json().get_key_for("huggingface")
-            model_args["token"] = key["api_key"]
-        if model_spec.model_config.get("trust_remote_code"):
-            model_args["trust_remote_code"] = True
-        if "attn_implementation" in model_spec.model_config:
-            model_args["attn_implementation"] = (
-                model_spec.model_config["attn_implementation"]
-            )
-
-        print(f"[train_sft] DDP: loading {model_spec['huggingface_id']} "
-              f"with device_map={{'': {local_rank}}}")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_spec["huggingface_id"], **model_args
-        )
-        if "peft_model" in model_spec.model_config:
-            model = PeftModel.from_pretrained(
-                model, model_spec.model_config["peft_model"]
-            )
-        return model
-
-    _hf_api.load_model = _load_model_ddp
+    AutoModelForCausalLM.from_pretrained = _from_pretrained_ddp
 
 
-_patch_clemcore_for_ddp()
+_patch_device_map_for_ddp()
 
 
 # ----------------------------- configuration ----------------------------- #
@@ -118,17 +98,22 @@ CONFIG = SimpleNamespace(
     completion_only_loss=True,
 
     # optimization. Effective global batch = num_gpus * per_device * grad_accum.
-    # Iter 1 single-GPU defaults gave 1*1*8=8. With 4 GPUs we keep ≈8 via
-    # 4 * 2 * 1, doubling throughput per GPU to fully use VRAM.
+    # Iter 2: 4 GPUs * 1 per_device * 2 grad_accum = 8 (matches iter 1).
+    # We tried bs=2 first; that OOMed at seq_len=1024 on A10G even with
+    # gradient checkpointing budget headroom — episodes longer than the
+    # nominal max push past it. bs=1 + grad_accum=2 is safe.
     num_train_epochs=3,
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=1,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=2,
     learning_rate=2e-4,
     warmup_ratio=0.03,
     weight_decay=0.0,
     lr_scheduler_type="cosine",
     bf16=True,
-    gradient_checkpointing=False,
+    # bs=2 seq=1024 OOMs on a 23GB A10G without checkpointing (~22GB used,
+    # OOM at first step). With checkpointing, activations get recomputed in
+    # backward — slower per step (~30%) but cuts activation memory ~5×.
+    gradient_checkpointing=True,
 
     # eval & logging
     eval_strategy="epoch",

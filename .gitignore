@@ -21,14 +21,22 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Model checkpoints + eval outputs (also live on NVMe via symlinks)
+# Model checkpoints + eval outputs (live on NVMe via symlinks)
+models
 models/
+playpen-eval
 playpen-eval/
-results/
+dist
+dist/
 *.bin
 *.safetensors
 *.pt
 *.ckpt
+
+# results/ is tracked (small CSVs and val.jsons), but exclude any large
+# byproducts that might accidentally land there
+results/**/*.html
+results/**/transcripts/
 
 # Data caches
 hf-cache/

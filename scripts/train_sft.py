@@ -102,7 +102,11 @@ CONFIG = SimpleNamespace(
     # We tried bs=2 first; that OOMed at seq_len=1024 on A10G even with
     # gradient checkpointing budget headroom — episodes longer than the
     # nominal max push past it. bs=1 + grad_accum=2 is safe.
-    num_train_epochs=3,
+    # Epochs: 1 (iter 2). Iter 1 ran 3 epochs in 4h with worse data; iter 2
+    # at max_length=1024 trains on ~5x more useful tokens per epoch, so 1
+    # epoch already exceeds iter 1's effective compute. Keeps wall-clock
+    # ~2.5h instead of 7.5h.
+    num_train_epochs=1,
     per_device_train_batch_size=1,
     gradient_accumulation_steps=2,
     learning_rate=2e-4,
@@ -116,12 +120,15 @@ CONFIG = SimpleNamespace(
     gradient_checkpointing=True,
 
     # eval & logging
-    # save_strategy="epoch" with 3 epochs over 6063 steps means the first
-    # checkpoint doesn't land until step 2021 — ~1.5h on 4xA10G with no
-    # crash recovery before that. Save every 1000 steps with total_limit=2
-    # so we always have a recent fallback. (Iter 2 ran with the previous
-    # "epoch" setting; this changes future runs only.)
-    eval_strategy="epoch",
+    # eval_strategy is "no" — TRL's eval loop disables gradient
+    # checkpointing for eval batches, which on 4xA10G ballooned activations
+    # by ~7GB and OOMed at the first epoch boundary (step 2021) in iter 2.
+    # We measure model quality via the full clembench eval suite after
+    # training anyway, so eval_loss during training adds nothing.
+    #
+    # save_strategy="steps", save_steps=1000 → checkpoints every ~1h and at
+    # the final step. save_total_limit=2 keeps disk bounded.
+    eval_strategy="no",
     logging_steps=25,
     save_strategy="steps",
     save_steps=1000,
@@ -157,6 +164,11 @@ class PlayschoolSftTrainer(BasePlaypenTrainer):
             ds = ds.filter(lambda ep: ep["meta"]["outcome"] == "success")
         print(f"[train_sft] dataset: kept {len(ds)}/{before} episodes "
               f"(success_only={CONFIG.success_only})")
+
+        if CONFIG.eval_strategy == "no":
+            # Skip the dev split entirely — saves tokenization time and
+            # avoids holding ~20% of the data out for an unused metric.
+            return {"train": ds.shuffle(seed=CONFIG.seed), "test": None}
 
         split = ds.train_test_split(
             CONFIG.eval_split, shuffle=True, seed=CONFIG.seed
@@ -211,7 +223,7 @@ class PlayschoolSftTrainer(BasePlaypenTrainer):
         trainer = trl.SFTTrainer(
             model=self.learner.model,
             train_dataset=dataset["train"],
-            eval_dataset=dataset["test"],
+            eval_dataset=dataset["test"],  # may be None when eval disabled
             args=sft_cfg,
             peft_config=peft_cfg,
         )

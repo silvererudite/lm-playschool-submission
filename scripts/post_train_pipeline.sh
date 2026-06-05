@@ -74,12 +74,16 @@ python "$ROOT/scripts/merge_and_push.py" \
     --adapter "$CKPT" \
     --repo "$HF_REPO"
 
-# 5+6+7. eval baseline and SFT, write comparison
+# 5+6+7. eval baseline and SFT, write comparison.
+# Output filename derives from the HF_REPO basename so successive iters don't
+# overwrite each other. e.g. Shamima/lm-playschool-qwen3.5-2b-sft-iter2 ->
+# results/lm-playschool-qwen3.5-2b-sft-iter2.md.
+OUT_FILE="$ROOT/results/$(basename "$HF_REPO").md"
 python "$ROOT/scripts/eval.py" \
     --suite all \
     --model Qwen3.5-2B \
     --model Qwen3.5-2B-sft \
     --baseline Qwen3.5-2B \
-    --out "$ROOT/results/iter1.md"
+    --out "$OUT_FILE"
 
 echo "===== END $(date -Iseconds) ====="
